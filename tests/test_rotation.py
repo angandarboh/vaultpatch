@@ -7,79 +7,116 @@ import pytest
 
 from vaultpatch.config import NamespaceConfig
 from vaultpatch.rotation import (
+    generate_secret,
+    rotate_secret,
     RotationReport,
     RotationResult,
-    generate_secret,
-    rotate_namespace,
-    rotate_secret,
+    _split_mount,
 )
 
 
-@pytest.fixture()
+@pytest.fixture
 def ns_config() -> NamespaceConfig:
-    return NamespaceConfig(name="dev", url="https://vault.dev", mount="secret")
+    return NamespaceConfig(
+        name="prod",
+        url="https://vault.example.com",
+        token="root",
+        path_prefix="secret/",
+    )
 
 
-@pytest.fixture()
-def vault_client(ns_config: NamespaceConfig) -> MagicMock:
+@pytest.fixture
+def vault_client() -> MagicMock:
     client = MagicMock()
-    client.secrets.kv.v2.read_secret_version.return_value = {
-        "data": {"data": {"password": "old", "token": "old-token"}}
-    }
+    client.secrets.kv.v2.create_or_update_secret.return_value = {"data": {}}
     return client
 
 
-def test_generate_secret_length() -> None:
-    s = generate_secret(24)
-    assert len(s) == 24
+# --- generate_secret ---
+
+def test_generate_secret_length():
+    assert len(generate_secret(24)) == 24
 
 
-def test_generate_secret_uniqueness() -> None:
-    assert generate_secret() != generate_secret()
+def test_generate_secret_default_length():
+    assert len(generate_secret()) == 32
 
 
-def test_rotate_secret_success(ns_config, vault_client) -> None:
-    result = rotate_secret(vault_client, ns_config, "app/db", "password")
-    assert result.success is True
-    assert result.namespace == "dev"
-    assert result.path == "app/db"
-    assert result.key == "password"
+def test_generate_secret_uniqueness():
+    values = {generate_secret() for _ in range(20)}
+    assert len(values) == 20
+
+
+def test_generate_secret_minimum_length_enforced():
+    with pytest.raises(ValueError, match="at least 8"):
+        generate_secret(4)
+
+
+# --- _split_mount ---
+
+def test_split_mount_basic():
+    mount, path = _split_mount("secret/myapp/db")
+    assert mount == "secret"
+    assert path == "myapp/db"
+
+
+def test_split_mount_leading_slash():
+    mount, path = _split_mount("/kv/service/key")
+    assert mount == "kv"
+    assert path == "service/key"
+
+
+def test_split_mount_no_subpath_raises():
+    with pytest.raises(ValueError):
+        _split_mount("onlymount")
+
+
+# --- rotate_secret ---
+
+def test_rotate_secret_success(ns_config, vault_client):
+    result = rotate_secret(vault_client, ns_config, "secret/app/db")
     assert result.error is None
+    assert result.namespace == "prod"
+    assert result.path == "secret/app/db"
+    assert len(result.new_value) == 32
     vault_client.secrets.kv.v2.create_or_update_secret.assert_called_once()
 
 
-def test_rotate_secret_uses_provided_value(ns_config, vault_client) -> None:
-    rotate_secret(vault_client, ns_config, "app/db", "password", new_value="fixed")
-    call_kwargs = vault_client.secrets.kv.v2.create_or_update_secret.call_args.kwargs
-    assert call_kwargs["secret"]["password"] == "fixed"
+def test_rotate_secret_vault_error(ns_config, vault_client):
+    vault_client.secrets.kv.v2.create_or_update_secret.side_effect = Exception("permission denied")
+    result = rotate_secret(vault_client, ns_config, "secret/app/key")
+    assert result.error == "permission denied"
+    assert result.new_value is None
 
 
-def test_rotate_secret_preserves_other_keys(ns_config, vault_client) -> None:
-    rotate_secret(vault_client, ns_config, "app/db", "password", new_value="new")
-    call_kwargs = vault_client.secrets.kv.v2.create_or_update_secret.call_args.kwargs
-    assert "token" in call_kwargs["secret"]
+# --- RotationReport ---
+
+def test_rotation_report_successes_and_failed():
+    results = [
+        RotationResult(namespace="prod", path="secret/a", new_value="abc"),
+        RotationResult(namespace="prod", path="secret/b", error="timeout"),
+    ]
+    report = RotationReport(results)
+    assert len(report.successes()) == 1
+    assert len(report.failed()) == 1
 
 
-def test_rotate_secret_failure(ns_config) -> None:
-    bad_client = MagicMock()
-    bad_client.secrets.kv.v2.read_secret_version.side_effect = Exception("forbidden")
-    result = rotate_secret(bad_client, ns_config, "app/db", "password")
-    assert result.success is False
-    assert "forbidden" in result.error
-
-
-def test_rotation_report_summary(ns_config, vault_client) -> None:
-    targets = [{"path": "app/db", "key": "password"}, {"path": "app/db", "key": "token"}]
-    report = rotate_namespace(vault_client, ns_config, targets)
+def test_rotation_report_summary():
+    results = [
+        RotationResult(namespace="prod", path="secret/a", new_value="abc"),
+        RotationResult(namespace="prod", path="secret/b", new_value="xyz"),
+        RotationResult(namespace="prod", path="secret/c", error="denied"),
+    ]
+    report = RotationReport(results)
     summary = report.summary()
-    assert summary["total"] == 2
-    assert summary["succeeded"] == 2
-    assert summary["failed"] == 0
+    assert "2 rotated" in summary
+    assert "1 failed" in summary
 
 
-def test_rotation_report_failures() -> None:
-    r1 = RotationResult(namespace="dev", path="p", key="k", success=True)
-    r2 = RotationResult(namespace="dev", path="p", key="k2", success=False, error="err")
-    report = RotationReport(results=[r1, r2])
-    assert len(report.failures()) == 1
-    assert report.failures()[0].key == "k2"
+def test_rotation_report_paths_rotated():
+    results = [
+        RotationResult(namespace="prod", path="secret/x", new_value="val"),
+        RotationResult(namespace="prod", path="secret/y", error="err"),
+    ]
+    report = RotationReport(results)
+    assert report.paths_rotated() == ["secret/x"]

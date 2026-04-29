@@ -4,19 +4,19 @@ from __future__ import annotations
 import secrets
 import string
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
+from typing import List, Optional
 
 import hvac
 
-from vaultpatch.config import NamespaceConfig
-
+from .config import NamespaceConfig
 
 _ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*"
 
 
 def generate_secret(length: int = 32) -> str:
-    """Generate a cryptographically secure random secret."""
+    """Return a cryptographically random secret string of *length* characters."""
+    if length < 8:
+        raise ValueError("Secret length must be at least 8 characters.")
     return "".join(secrets.choice(_ALPHABET) for _ in range(length))
 
 
@@ -24,78 +24,59 @@ def generate_secret(length: int = 32) -> str:
 class RotationResult:
     namespace: str
     path: str
-    key: str
-    success: bool
-    rotated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    error: str | None = None
-
-    @property
-    def failed(self) -> bool:
-        return not self.success
+    new_value: Optional[str] = None
+    error: Optional[str] = None
 
 
 @dataclass
 class RotationReport:
-    results: list[RotationResult] = field(default_factory=list)
+    results: List[RotationResult] = field(default_factory=list)
 
-    def successes(self) -> list[RotationResult]:
-        return [r for r in self.results if r.success]
+    def failed(self) -> List[RotationResult]:
+        """Return results where an error occurred."""
+        return [r for r in self.results if r.error]
 
-    def failures(self) -> list[RotationResult]:
-        return [r for r in self.results if r.failed]
+    def successes(self) -> List[RotationResult]:
+        """Return results that completed without error."""
+        return [r for r in self.results if not r.error]
 
-    def summary(self) -> dict[str, int]:
-        return {
-            "total": len(self.results),
-            "succeeded": len(self.successes()),
-            "failed": len(self.failures()),
-        }
+    def summary(self) -> str:
+        ok = len(self.successes())
+        fail = len(self.failed())
+        return f"{ok} rotated successfully, {fail} failed."
+
+    def paths_rotated(self) -> List[str]:
+        """Return paths of successfully rotated secrets."""
+        return [r.path for r in self.successes()]
 
 
 def rotate_secret(
     client: hvac.Client,
-    ns_config: NamespaceConfig,
+    ns: NamespaceConfig,
     path: str,
-    key: str,
-    new_value: str | None = None,
+    key: str = "value",
+    length: int = 32,
 ) -> RotationResult:
-    """Rotate a single secret key at the given KV-v2 path."""
-    value = new_value or generate_secret()
-    try:
-        existing = client.secrets.kv.v2.read_secret_version(
-            path=path, mount_point=ns_config.mount
-        )
-        data: dict[str, Any] = existing["data"]["data"].copy()
-        data[key] = value
-        client.secrets.kv.v2.create_or_update_secret(
-            path=path, secret=data, mount_point=ns_config.mount
-        )
-        return RotationResult(
-            namespace=ns_config.name, path=path, key=key, success=True
-        )
-    except Exception as exc:  # noqa: BLE001
-        return RotationResult(
-            namespace=ns_config.name,
-            path=path,
-            key=key,
-            success=False,
-            error=str(exc),
-        )
+    """Generate a new secret and write it to *path* in Vault.
 
-
-def rotate_namespace(
-    client: hvac.Client,
-    ns_config: NamespaceConfig,
-    targets: list[dict[str, str]],
-) -> RotationReport:
-    """Rotate multiple secrets within a namespace.
-
-    Each entry in *targets* must have ``path`` and ``key``.
+    Returns a :class:`RotationResult` describing the outcome.
     """
-    report = RotationReport()
-    for target in targets:
-        result = rotate_secret(
-            client, ns_config, target["path"], target["key"]
+    new_value = generate_secret(length)
+    try:
+        mount, secret_path = _split_mount(path)
+        client.secrets.kv.v2.create_or_update_secret(
+            path=secret_path,
+            secret={key: new_value},
+            mount_point=mount,
         )
-        report.results.append(result)
-    return report
+        return RotationResult(namespace=ns.name, path=path, new_value=new_value)
+    except Exception as exc:  # noqa: BLE001
+        return RotationResult(namespace=ns.name, path=path, error=str(exc))
+
+
+def _split_mount(path: str) -> tuple[str, str]:
+    """Split 'mount/some/path' into ('mount', 'some/path')."""
+    parts = path.lstrip("/").split("/", 1)
+    if len(parts) < 2:
+        raise ValueError(f"Path '{path}' must include a mount point prefix.")
+    return parts[0], parts[1]

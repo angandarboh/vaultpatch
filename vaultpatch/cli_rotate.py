@@ -1,81 +1,85 @@
-"""CLI sub-command: rotate secrets across namespaces."""
+"""CLI command for bulk secret rotation across Vault namespaces."""
 from __future__ import annotations
 
-import json
 import sys
-from pathlib import Path
-from typing import Any
+from collections import defaultdict
+from typing import Dict, List
 
 import click
+import hvac
 
-from vaultpatch.client import ClientError, build_client
-from vaultpatch.config import ConfigError, load_config
-from vaultpatch.rotation import rotate_namespace
+from .client import build_client, ClientError
+from .config import load_config, ConfigError, NamespaceConfig
+from .rotation import rotate_secret, RotationReport, RotationResult
+
+
+def _group_by_namespace(
+    paths: List[str], namespaces: List[NamespaceConfig]
+) -> Dict[str, List[str]]:
+    """Return {namespace_name: [paths]} for namespaces whose path_prefix matches."""
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for ns in namespaces:
+        for path in paths:
+            if path.startswith(ns.path_prefix):
+                grouped[ns.name].append(path)
+    return dict(grouped)
 
 
 @click.command("rotate")
-@click.option(
-    "--config",
-    "config_path",
-    default="vaultpatch.yaml",
-    show_default=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="Path to vaultpatch config file.",
-)
-@click.option(
-    "--targets",
-    "targets_path",
-    required=True,
-    type=click.Path(exists=True, dir_okay=False),
-    help="JSON file listing {namespace, path, key} rotation targets.",
-)
-@click.option("--dry-run", is_flag=True, default=False, help="Print plan without rotating.")
-def rotate_cmd(config_path: str, targets_path: str, dry_run: bool) -> None:
-    """Bulk-rotate secrets defined in TARGETS across configured namespaces."""
+@click.option("--config", "config_path", required=True, help="Path to vaultpatch config YAML.")
+@click.option("--namespace", "ns_filter", default=None, help="Limit rotation to a single namespace.")
+@click.option("--path", "paths", multiple=True, required=True, help="Secret path(s) to rotate.")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview rotations without writing.")
+@click.option("--length", default=32, show_default=True, help="Generated secret length.")
+def rotate_cmd(
+    config_path: str,
+    ns_filter: str | None,
+    paths: tuple,
+    dry_run: bool,
+    length: int,
+) -> None:
+    """Bulk-rotate secrets at the given paths across configured namespaces."""
     try:
-        cfg = load_config(Path(config_path))
+        cfg = load_config(config_path)
     except ConfigError as exc:
         click.echo(f"Config error: {exc}", err=True)
         sys.exit(1)
 
-    raw: list[dict[str, Any]] = json.loads(Path(targets_path).read_text())
-    ns_map = {ns.name: ns for ns in cfg.namespaces}
+    namespaces = cfg.namespaces
+    if ns_filter:
+        namespaces = [ns for ns in namespaces if ns.name == ns_filter]
+        if not namespaces:
+            click.echo(f"No namespace matching '{ns_filter}' found.", err=True)
+            sys.exit(1)
 
-    for ns_name, targets in _group_by_namespace(raw).items():
-        ns_config = ns_map.get(ns_name)
-        if ns_config is None:
-            click.echo(f"[WARN] Unknown namespace '{ns_name}', skipping.", err=True)
+    path_list = list(paths)
+    grouped = _group_by_namespace(path_list, namespaces)
+
+    all_results: list[RotationResult] = []
+
+    for ns in namespaces:
+        ns_paths = grouped.get(ns.name, [])
+        if not ns_paths:
             continue
-
-        if dry_run:
-            for t in targets:
-                click.echo(f"[DRY-RUN] {ns_name} :: {t['path']}#{t['key']}")
-            continue
-
         try:
-            client = build_client(ns_config)
+            client = build_client(ns)
         except ClientError as exc:
-            click.echo(f"[ERROR] {ns_name}: {exc}", err=True)
+            click.echo(f"[{ns.name}] Client error: {exc}", err=True)
             continue
 
-        report = rotate_namespace(client, ns_config, targets)
-        for result in report.results:
-            status = "OK" if result.success else f"FAIL({result.error})"
-            click.echo(f"[{status}] {ns_name} :: {result.path}#{result.key}")
+        for path in ns_paths:
+            if dry_run:
+                click.echo(f"[DRY-RUN] [{ns.name}] Would rotate: {path}")
+                continue
+            result = rotate_secret(client, ns, path, length=length)
+            all_results.append(result)
+            status = "OK" if not result.error else f"FAIL ({result.error})"
+            click.echo(f"[{ns.name}] {path}: {status}")
 
-        summary = report.summary()
-        click.echo(
-            f"  → namespace '{ns_name}': "
-            f"{summary['succeeded']}/{summary['total']} rotated."
-        )
+    if dry_run:
+        return
 
-
-def _group_by_namespace(
-    targets: list[dict[str, Any]]
-) -> dict[str, list[dict[str, str]]]:
-    grouped: dict[str, list[dict[str, str]]] = {}
-    for t in targets:
-        grouped.setdefault(t["namespace"], []).append(
-            {"path": t["path"], "key": t["key"]}
-        )
-    return grouped
+    report = RotationReport(all_results)
+    click.echo(f"\nSummary: {len(report.successes())} rotated, {len(report.failed())} failed.")
+    if report.failed():
+        sys.exit(2)
