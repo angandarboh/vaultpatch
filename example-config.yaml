@@ -1,0 +1,38 @@
+# vaultpatch example configuration
+# Copy this file to vaultpatch.yaml and adjust for your environment.
+
+# Set dry_run: true to preview changes without writing to Vault.
+dry_run: false
+
+# Optional path to write a structured JSON audit log.
+# If omitted, audit events are printed to stdout only.
+audit_log: /var/log/vaultpatch/audit.log
+
+namespaces:
+  # Production Vault cluster
+  - name: prod
+    address: https://vault.prod.example.com
+    # Name of the environment variable that holds the Vault token for this namespace.
+    token_env: VAULT_TOKEN_PROD
+    auth_method: token   # currently only 'token' is supported
+    secret_paths:
+      - secret/data/postgres/password
+      - secret/data/redis/auth_token
+      - secret/data/external-api/key
+
+  # Staging Vault cluster
+  - name: staging
+    address: https://vault.staging.example.com
+    token_env: VAULT_TOKEN_STAGING
+    auth_method: token
+    secret_paths:
+      - secret/data/postgres/password
+      - secret/data/redis/auth_token
+
+  # Development Vault cluster (local)
+  - name: dev
+    address: http://127.0.0.1:8200
+    token_env: VAULT_TOKEN_DEV
+    auth_method: token
+    secret_paths:
+      - secret/data/postgres/password
