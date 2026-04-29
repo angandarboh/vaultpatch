@@ -1,0 +1,30 @@
+{
+  "namespace": "production",
+  "created_at": "2024-06-01T12:00:00",
+  "entries": [
+    {
+      "path": "app/database",
+      "data": {
+        "username": "db_user",
+        "password": "REDACTED"
+      },
+      "captured_at": "2024-06-01T12:00:01"
+    },
+    {
+      "path": "app/api_keys",
+      "data": {
+        "stripe_key": "REDACTED",
+        "sendgrid_key": "REDACTED"
+      },
+      "captured_at": "2024-06-01T12:00:02"
+    },
+    {
+      "path": "infra/tls",
+      "data": {
+        "cert": "REDACTED",
+        "key": "REDACTED"
+      },
+      "captured_at": "2024-06-01T12:00:03"
+    }
+  ]
+}
