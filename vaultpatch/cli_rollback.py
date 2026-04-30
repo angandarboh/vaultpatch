@@ -1,8 +1,7 @@
-"""CLI command: vaultpatch rollback — restore secrets from a snapshot file."""
+"""CLI command for rolling back secrets to a previous snapshot."""
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -10,62 +9,95 @@ import click
 
 from vaultpatch.client import build_client, ClientError
 from vaultpatch.config import load_config, ConfigError
-from vaultpatch.rollback import rollback_snapshot
-from vaultpatch.snapshot import Snapshot
+from vaultpatch.rollback import perform_rollback, RollbackReport
+from vaultpatch.snapshot import load_snapshot
 
 
-@click.command("rollback")
-@click.argument("snapshot_file", type=click.Path(exists=True))
-@click.option("--config", "config_path", default="vaultpatch.yaml", show_default=True)
-@click.option("--namespace", "ns_filter", default=None, help="Limit to one namespace.")
-@click.option("--dry-run", is_flag=True, default=False, help="Preview without writing.")
+def _print_report(report: RollbackReport) -> None:
+    summary = report.summary()
+    click.echo(f"\nRollback complete: {summary['successes']} succeeded, {summary['failures']} failed.")
+
+    if report.successes():
+        click.echo("\n✔ Restored:")
+        for r in report.successes():
+            click.echo(f"  [{r.namespace}] {r.path}")
+
+    if report.failed():
+        click.echo("\n✘ Failed:")
+        for r in report.failed():
+            click.echo(f"  [{r.namespace}] {r.path} — {r.error}")
+
+
+@click.command(name="rollback")
+@click.option(
+    "--config", "config_path",
+    default="vaultpatch.yaml",
+    show_default=True,
+    help="Path to the vaultpatch config file.",
+)
+@click.option(
+    "--snapshot", "snapshot_path",
+    required=True,
+    help="Path to the snapshot JSON file to restore from.",
+)
+@click.option(
+    "--namespace", "namespace_filter",
+    default=None,
+    help="Restrict rollback to a specific namespace alias.",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Preview which secrets would be restored without writing.",
+)
 def rollback_cmd(
-    snapshot_file: str,
     config_path: str,
-    ns_filter: str | None,
+    snapshot_path: str,
+    namespace_filter: str | None,
     dry_run: bool,
 ) -> None:
-    """Restore secrets from SNAPSHOT_FILE to Vault."""
+    """Restore secrets from a snapshot file."""
     try:
-        cfg = load_config(config_path)
+        cfg = load_config(Path(config_path))
     except ConfigError as exc:
         click.echo(f"Config error: {exc}", err=True)
         sys.exit(1)
 
-    raw = json.loads(Path(snapshot_file).read_text())
-    snapshot = Snapshot.from_dict(raw)
-
-    namespaces = [
-        ns for ns in cfg.namespaces
-        if ns_filter is None or ns.name == ns_filter
-    ]
-
-    if not namespaces:
-        click.echo("No matching namespaces found.", err=True)
+    snapshot_file = Path(snapshot_path)
+    if not snapshot_file.exists():
+        click.echo(f"Snapshot file not found: {snapshot_path}", err=True)
         sys.exit(1)
 
-    if dry_run:
-        click.echo("[dry-run] No changes will be written.")
+    snapshot = load_snapshot(snapshot_file)
 
-    exit_code = 0
-    for ns in namespaces:
-        click.echo(f"\nNamespace: {ns.name}")
+    namespaces = cfg.namespaces
+    if namespace_filter:
+        namespaces = [ns for ns in namespaces if ns.alias == namespace_filter]
+        if not namespaces:
+            click.echo(f"No namespace matching alias '{namespace_filter}'.", err=True)
+            sys.exit(1)
+
+    if dry_run:
+        click.echo("[dry-run] The following secrets would be restored:")
+        for entry in snapshot.entries:
+            if namespace_filter and entry.namespace != namespace_filter:
+                continue
+            click.echo(f"  [{entry.namespace}] {entry.path}")
+        return
+
+    all_results: list = []
+    for ns_cfg in namespaces:
         try:
-            client = build_client(ns)
+            client = build_client(ns_cfg)
         except ClientError as exc:
-            click.echo(f"  Auth error: {exc}", err=True)
-            exit_code = 1
+            click.echo(f"Client error for '{ns_cfg.alias}': {exc}", err=True)
             continue
 
-        report = rollback_snapshot(client, snapshot, ns.name, dry_run=dry_run)
+        report = perform_rollback(ns_cfg, client, snapshot)
+        all_results.extend(report.results)
 
-        for result in report.successes():
-            marker = "(dry-run) " if dry_run else ""
-            click.echo(f"  {marker}restored  {result.path}")
-        for result in report.failed():
-            click.echo(f"  FAILED    {result.path}: {result.error}", err=True)
-            exit_code = 1
+    from vaultpatch.rollback import RollbackReport  # local to avoid circular
+    combined = RollbackReport(results=all_results)
+    _print_report(combined)
 
-        click.echo(f"  {report.summary()}")
-
-    sys.exit(exit_code)
+    if combined.failed():
+        sys.exit(2)
